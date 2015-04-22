@@ -11,31 +11,22 @@ namespace Piwik\Plugins\Goals\Reports;
 use Piwik\Piwik;
 use Piwik\Plugins\CoreHome\Columns\Metrics\ConversionRate;
 
-class Get extends Base
+class GetMetrics extends Base
 {
     protected function init()
     {
         parent::init();
 
         $this->name = Piwik::translate('Goals_Goals');
-        $this->processedMetrics = array();
+        $this->processedMetrics = array(new ConversionRate());
         $this->documentation = ''; // TODO
         $this->order = 1;
         $this->orderGoal = 50;
-        $this->metrics = array('nb_conversions', 'nb_visits_converted', 'revenue');
+        $this->metrics = array( 'nb_conversions', 'nb_visits_converted', 'revenue');
         $this->parameters = null;
     }
 
     public function configureReportMetadata(&$availableReports, $infos)
     {
-        if (!$this->isEnabled()) {
-            return;
-        }
-
-        parent::configureReportMetadata($availableReports, $infos);
-
-        $this->addReportMetadataForEachGoal($availableReports, $infos, function ($goal) {
-            return Piwik::translate('Goals_GoalX', $goal['name']);
-        });
     }
 }

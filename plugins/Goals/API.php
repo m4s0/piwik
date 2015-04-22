@@ -9,6 +9,7 @@
 namespace Piwik\Plugins\Goals;
 
 use Exception;
+use Piwik\API\Request;
 use Piwik\Archive;
 use Piwik\CacheId;
 use Piwik\Cache as PiwikCache;
@@ -24,6 +25,7 @@ use Piwik\Segment\SegmentExpression;
 use Piwik\Site;
 use Piwik\Tracker\Cache;
 use Piwik\Tracker\GoalManager;
+use Piwik\Plugins\VisitFrequency\API as VisitFrequencyAPI;
 
 /**
  * Goals API lets you Manage existing goals, via "updateGoal" and "deleteGoal", create new Goals via "addGoal",
@@ -48,6 +50,9 @@ use Piwik\Tracker\GoalManager;
 class API extends \Piwik\Plugin\API
 {
     const AVG_PRICE_VIEWED = 'avg_price_viewed';
+
+    // visitorType==new
+    const NEW_VISITOR_SEGMENT = "visitorType%3D%3Dnew";
 
     /**
      * Returns all Goals for a given website, or list of websites
@@ -342,75 +347,43 @@ class API extends \Piwik\Plugin\API
     {
         Piwik::checkUserHasViewAccess($idSite);
 
-        $returnSegment = urldecode(\Piwik\Plugins\VisitFrequency\API::RETURNING_VISITOR_SEGMENT);
-        $newSegment = 'visitorType==new'; // todo make constant
+        $returnSegment = VisitFrequencyAPI::RETURNING_VISITOR_SEGMENT;
+        $newSegment    = self::NEW_VISITOR_SEGMENT;
 
         $table = new DataTable\Simple();
 
-        foreach (array(false, $newSegment, $returnSegment) as $segmentPredefined) {
-            $useSegment = $this->appendReturningVisitorSegment($segmentPredefined, $segment);
+        $segments = array(false, '_new_visit' => $newSegment, '_returning_visit' => $returnSegment);
 
-            $archive = Archive::build($idSite, $period, $date, $useSegment);
+        foreach ($segments as $appendMetric => $segmentPredefined) {
+            $useSegment = $this->appendSegment($segmentPredefined, $segment);
 
-            // Mapping string idGoal to internal ID
-            $idGoal = self::convertSpecialGoalIds($idGoal);
-            $isEcommerceGoal = $idGoal === GoalManager::IDGOAL_ORDER || $idGoal === GoalManager::IDGOAL_CART;
+            /** @var DataTable $dataTable */
+            $dataTable = Request::processRequest('Goals.getMetrics', array(
+                'segment' => $useSegment,
+                'idSite' => $idSite,
+                'period' => $period,
+                'date' => $date,
+                'idGoal' => $idGoal,
+                'columns' => $columns
+            ));
 
-            $allMetrics = Goals::getGoalColumns($idGoal);
-            $requestedColumns = Piwik::getArrayFromApiParameter($columns);
-
-            $report = Report::factory("Goals", "get");
-            $columnsToGet = $report->getMetricsRequiredForReport($allMetrics, $requestedColumns);
-
-            $inDbMetricNames = array_map(function ($name) use ($idGoal) {
-                return $name == 'nb_visits' ? $name : Archiver::getRecordName($name, $idGoal);
-            }, $columnsToGet);
-            $dataTable = $archive->getDataTableFromNumeric($inDbMetricNames);
-
-            $newNameMapping = array_combine($inDbMetricNames, $columnsToGet);
-
-            if ($useSegment === $newSegment) {
-                $newNameMapping = array_map(function ($metric) {
-                    return $metric . '_new';
-                }, $newNameMapping);
-            } elseif ($useSegment === $returnSegment) {
-                $newNameMapping = array_map(function ($metric) {
-                    return $metric . '_returning';
-                }, $newNameMapping);
-            } elseif (count($columnsToGet) <= 0) {
-                $newNameMapping = array();
-            }
-
-            $dataTable->filter('ReplaceColumnNames', array($newNameMapping));
-
-            if (!empty($segmentPredefined)) {
-                $table->addDataTable($dataTable);
+            if (!$dataTable->getRowsCount()) {
                 continue;
             }
 
-            // TODO: this should be in Goals/Get.php but it depends on idGoal parameter which isn't always in _GET (ie,
-            //       it's not in ProcessedReport.php). more refactoring must be done to report class before this can be
-            //       corrected.
-            if ((in_array('avg_order_revenue', $requestedColumns)
-                    || empty($requestedColumns))
-                && $isEcommerceGoal
-            ) {
-                $dataTable->filter(function (DataTable $table) {
-                    $extraProcessedMetrics = $table->getMetadata(DataTable::EXTRA_PROCESSED_METRICS_METADATA_NAME);
-                    $extraProcessedMetrics[] = new AverageOrderRevenue();
-                    $table->setMetadata(DataTable::EXTRA_PROCESSED_METRICS_METADATA_NAME, $extraProcessedMetrics);
+            if (!empty($segmentPredefined)) {
+                $dataTable->filter(function (DataTable $dataTable)  use ($appendMetric){
+                    $row = $dataTable->getFirstRow();
+                    $columnNames = array_keys($row->getColumns());
+                    $newNames = array_map(function ($metricName) use ($appendMetric) {
+                        return $metricName . $appendMetric;
+                    }, $columnNames);
+
+                    $newNameMapping = array_combine($columnNames, $newNames);
+
+                    $dataTable->filter('ReplaceColumnNames', array($newNameMapping));
                 });
             }
-
-            // remove temporary metrics that were not explicitly requested
-            $allColumns = $allMetrics;
-            $allColumns[] = 'conversion_rate';
-            if ($isEcommerceGoal) {
-                $allColumns[] = 'avg_order_revenue';
-            }
-
-            $columnsToShow = $requestedColumns ?: $allColumns;
-            $dataTable->queueFilter('ColumnDelete', array($columnsToRemove = array(), $columnsToShow));
 
             $table->addDataTable($dataTable);
         }
@@ -418,7 +391,73 @@ class API extends \Piwik\Plugin\API
         return $table;
     }
 
-    protected function appendReturningVisitorSegment($segment, $segmentToAppend)
+    /**
+     * Returns Goals data
+     *
+     * @param int $idSite
+     * @param string $period
+     * @param string $date
+     * @param bool $segment
+     * @param bool|int $idGoal
+     * @param array $columns Array of metrics to fetch: nb_conversions, conversion_rate, revenue
+     * @return DataTable
+     * @hide
+     */
+    public function getMetrics($idSite, $period, $date, $segment = false, $idGoal = false, $columns = array())
+    {
+        Piwik::checkUserHasViewAccess($idSite);
+        $archive = Archive::build($idSite, $period, $date, $segment);
+
+        // Mapping string idGoal to internal ID
+        $idGoal = self::convertSpecialGoalIds($idGoal);
+        $isEcommerceGoal = $idGoal === GoalManager::IDGOAL_ORDER || $idGoal === GoalManager::IDGOAL_CART;
+
+        $allMetrics = Goals::getGoalColumns($idGoal);
+        $requestedColumns = Piwik::getArrayFromApiParameter($columns);
+
+        $report = Report::factory('Goals', 'getMetrics');
+        $columnsToGet = $report->getMetricsRequiredForReport($allMetrics, $requestedColumns);
+
+        $inDbMetricNames = array_map(function ($name) use ($idGoal) {
+            return $name == 'nb_visits' ? $name : Archiver::getRecordName($name, $idGoal);
+        }, $columnsToGet);
+        $dataTable = $archive->getDataTableFromNumeric($inDbMetricNames);
+
+        if (count($columnsToGet) > 0) {
+            $newNameMapping = array_combine($inDbMetricNames, $columnsToGet);
+        } else {
+            $newNameMapping = array();
+        }
+        $dataTable->filter('ReplaceColumnNames', array($newNameMapping));
+
+        // TODO: this should be in Goals/Get.php but it depends on idGoal parameter which isn't always in _GET (ie,
+        //       it's not in ProcessedReport.php). more refactoring must be done to report class before this can be
+        //       corrected.
+        if ((in_array('avg_order_revenue', $requestedColumns)
+                || empty($requestedColumns))
+            && $isEcommerceGoal
+        ) {
+            $dataTable->filter(function (DataTable $table) {
+                $extraProcessedMetrics = $table->getMetadata(DataTable::EXTRA_PROCESSED_METRICS_METADATA_NAME);
+                $extraProcessedMetrics[] = new AverageOrderRevenue();
+                $table->setMetadata(DataTable::EXTRA_PROCESSED_METRICS_METADATA_NAME, $extraProcessedMetrics);
+            });
+        }
+
+        // remove temporary metrics that were not explicitly requested
+        $allColumns = $allMetrics;
+        $allColumns[] = 'conversion_rate';
+        if ($isEcommerceGoal) {
+            $allColumns[] = 'avg_order_revenue';
+        }
+
+        $columnsToShow = $requestedColumns ?: $allColumns;
+        $dataTable->queueFilter('ColumnDelete', array($columnsToRemove = array(), $columnsToShow));
+
+        return $dataTable;
+    }
+
+    protected function appendSegment($segment, $segmentToAppend)
     {
         if (empty($segment)) {
             return $segmentToAppend;
